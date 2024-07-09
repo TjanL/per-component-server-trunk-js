@@ -1,0 +1,108 @@
+name: Build and deploy Server
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'server/**'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME_SERVER: tjanl/server-${{ github.event.repository.name }}
+
+jobs:
+  test-server:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1   
+
+      - name: Install dependencies
+        working-directory: server
+        run: poetry install
+
+      - name: Run tests
+        working-directory: server
+        run: poetry run pytest
+
+  build-and-push-server-image:
+    needs:
+      - test-server
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHRC_TOKEN }}
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_SERVER }}
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: server
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs:
+      - build-and-push-server-image
+    steps:
+      - name: Tailscale
+        uses: tailscale/github-action@v2
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          version: 1.66.4
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHRC_TOKEN }}
+
+      - name: Deploy Database
+        uses: TjanL/diplomska/actions/js/deploy@main
+        with:
+          ssh_key: ${{ secrets.SSH_PRIVATE_KEY }}
+          remote_docker_host: "bot@${{ secrets.TS_NODE_IP }}"
+          docker_image: "postgres:latest"
+          container_name: "database"
+          env_vars: "POSTGRES_PASSWORD=postgres,POSTGRES_USER=postgres,POSTGRES_DB=deploy"
+          volumes: "/home/bot/postgres/data:/var/lib/postgresql/data"
+          network: "prod"
+
+      - name: Deploy Server
+        uses: TjanL/diplomska/actions/js/deploy@main
+        with:
+          ssh_key: ${{ secrets.SSH_PRIVATE_KEY }}
+          remote_docker_host: "bot@${{ secrets.TS_NODE_IP }}"
+          docker_image: "${{ env.REGISTRY }}/${{ env.IMAGE_NAME_SERVER }}@${{ needs.build-and-push-server-image.outputs.digest }}"
+          container_name: "server"
+          env_vars: "DATABASE_HOST=postgresql://postgres:postgres@database/deploy"
+          ports: "8000:8000"
+          network: "prod"
